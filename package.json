@@ -1,0 +1,13 @@
+{
+  "name": "oci-appointment-checker",
+  "version": "1.0.0",
+  "description": "Checks Indian Embassy Netherlands for OCI appointment availability",
+  "main": "check_oci.js",
+  "scripts": {
+    "check": "node check_oci.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.14",
+    "playwright": "^1.44.0"
+  }
+}

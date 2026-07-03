@@ -1,0 +1,72 @@
+name: OCI/Surrender Checker (Matrix)
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # hourly — adjust to taste
+  workflow_dispatch: {}
+
+jobs:
+  check-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        day: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Check August ${{ matrix.day }}
+        env:
+          TARGET_DAY: ${{ matrix.day }}
+          SKIP_EMAIL: 'true'
+          RESULTS_FILE: results-${{ matrix.day }}.json
+          PARALLEL_WORKERS: '1'   # each matrix job only ever checks 1 day, so no in-job fan-out needed
+        run: node oci-checker.js
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.day }}
+          path: results-${{ matrix.day }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  aggregate:
+    needs: check-day
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+
+      - name: Aggregate and send one combined email
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: node aggregate-results.js results
