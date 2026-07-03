@@ -39,8 +39,8 @@ async function main() {
       continue;
     }
 
-    if (Array.isArray(data.overview) && data.overview.length === 0 && data.targetDay) {
-      missingDays.push(data.targetDay);
+    if (Array.isArray(data.missingRequestedDays)) {
+      missingDays.push(...data.missingRequestedDays);
     }
 
     allOverview.push(...(data.overview || []));

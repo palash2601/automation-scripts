@@ -5,14 +5,24 @@ on:
     - cron: '0 * * * *'   # hourly — adjust to taste
   workflow_dispatch: {}
 
+# IMPORTANT: the Docker image tag below must match the "playwright" version in
+# package.json (currently ^1.61.1). If you bump the npm package, bump this tag
+# too — mismatched versions can break browser launches. Check available tags
+# at https://mcr.microsoft.com/en-us/product/playwright/tags
+env:
+  BATCH_SIZE: 4   # how many days each check-days job handles; lower = more jobs but more parallel
+
 jobs:
-  check-day:
+  # Step 1: find out which August days are actually open for booking, and
+  # split them into batches. Avoids spinning up a job for every day of the
+  # month when only a handful are actually open.
+  discover:
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        day: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    outputs:
+      day_batches: ${{ steps.batch.outputs.day_batches }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,28 +33,71 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
-
-      - name: Check August ${{ matrix.day }}
+      - name: Discover open August days
         env:
-          TARGET_DAY: ${{ matrix.day }}
+          DISCOVER_ONLY: 'true'
+          DISCOVER_OUTPUT: discover-days.json
+        run: node oci-checker.js
+
+      - name: Split days into batches
+        id: batch
+        run: |
+          node -e "
+            const fs = require('fs');
+            const days = JSON.parse(fs.readFileSync('discover-days.json', 'utf8'));
+            const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '4', 10);
+            const batches = [];
+            for (let i = 0; i < days.length; i += BATCH_SIZE) {
+              batches.push(days.slice(i, i + BATCH_SIZE));
+            }
+            fs.writeFileSync('batches.json', JSON.stringify(batches));
+            console.log('Batches:', JSON.stringify(batches));
+          "
+          echo "day_batches=$(cat batches.json)" >> "$GITHUB_OUTPUT"
+
+  # Step 2: one job per batch of days, running the checks for its batch
+  # concurrently in-process via PARALLEL_WORKERS.
+  check-days:
+    needs: discover
+    if: needs.discover.outputs.day_batches != '[]'
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-jammy
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        days: ${{ fromJson(needs.discover.outputs.day_batches) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check days [${{ join(matrix.days, ', ') }}]
+        env:
+          TARGET_DAYS: ${{ join(matrix.days, ',') }}
           SKIP_EMAIL: 'true'
-          RESULTS_FILE: results-${{ matrix.day }}.json
-          PARALLEL_WORKERS: '1'   # each matrix job only ever checks 1 day, so no in-job fan-out needed
+          RESULTS_FILE: results-${{ join(matrix.days, '-') }}.json
+          PARALLEL_WORKERS: '3'
         run: node oci-checker.js
 
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.day }}
-          path: results-${{ matrix.day }}.json
+          name: results-${{ join(matrix.days, '-') }}
+          path: results-${{ join(matrix.days, '-') }}.json
           if-no-files-found: ignore
           retention-days: 1
 
+  # Step 3: merge every batch's results into one email.
   aggregate:
-    needs: check-day
+    needs: check-days
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -7,14 +7,26 @@ const AUGUST_MONTH_INDEX = 7;                 // 0-indexed (7 = August)
 const NAV_TIMEOUT = 30000;                    // real failure timeout, unchanged from before
 const PARALLEL_WORKERS = parseInt(process.env.PARALLEL_WORKERS || '3', 10);
 
-// Per-day matrix mode (for GitHub Actions): if TARGET_DAY is set, only that
-// day of August is checked instead of the whole month. Pairs with RESULTS_FILE
-// (write results to JSON instead of/as well as emailing) and SKIP_EMAIL (skip
-// sending an email from this job — used when an aggregator job will send one
-// combined email after all matrix jobs finish).
-const TARGET_DAY = process.env.TARGET_DAY ? parseInt(process.env.TARGET_DAY, 10) : null;
+// Per-day(s) matrix mode (for GitHub Actions): if TARGET_DAYS is set, only
+// those August days are checked instead of the whole month. Accepts a
+// comma-separated list ("3,4,5,6") so a single job can check a batch of days
+// (checked concurrently within the job via PARALLEL_WORKERS) rather than
+// spinning up one job per day. Pairs with RESULTS_FILE (write results to JSON
+// instead of/as well as emailing) and SKIP_EMAIL (skip sending an email from
+// this job — used when an aggregator job sends one combined email after all
+// matrix jobs finish).
+const TARGET_DAYS = process.env.TARGET_DAYS
+  ? process.env.TARGET_DAYS.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n))
+  : null;
 const RESULTS_FILE = process.env.RESULTS_FILE || null;
 const SKIP_EMAIL = process.env.SKIP_EMAIL === 'true';
+
+// Discover-only mode: scan the calendar, write out which August days are open
+// for booking, then exit WITHOUT checking any slots/services. Used as a fast
+// first step so the matrix can be generated only for days actually worth
+// checking, instead of always spinning up 31 jobs.
+const DISCOVER_ONLY = process.env.DISCOVER_ONLY === 'true';
+const DISCOVER_OUTPUT = process.env.DISCOVER_OUTPUT || 'discover-days.json';
 
 // ── Notification ──────────────────────────────────────────────────────────────
 async function sendEmail(subject, body) {
@@ -60,6 +72,23 @@ async function runPool(items, concurrency, workerFn) {
 // ── Event-driven wait helper: waits for network to go quiet, capped ──────────
 async function waitForNetworkQuiet(page, timeout = 8000) {
   await page.waitForLoadState('networkidle', { timeout }).catch(() => {});
+}
+
+// ── Block images/fonts/media/known trackers so pages load faster ────────────
+const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media']);
+const BLOCKED_HOST_FRAGMENTS = [
+  'google-analytics.com', 'googletagmanager.com', 'doubleclick.net',
+  'facebook.net', 'facebook.com', 'connect.facebook.net',
+  'hotjar.com', 'clarity.ms', 'analytics.google.com',
+];
+
+async function blockUnnecessaryResources(page) {
+  await page.route('**/*', (route) => {
+    const req = route.request();
+    if (BLOCKED_RESOURCE_TYPES.has(req.resourceType())) return route.abort();
+    if (BLOCKED_HOST_FRAGMENTS.some(h => req.url().includes(h))) return route.abort();
+    return route.continue();
+  });
 }
 
 // ── Navigate to the booking form, handling consent if it appears ─────────────
@@ -263,6 +292,7 @@ async function checkDatesInParallel(browser, storageState, dates, concurrency) {
     const context = await browser.newContext({ storageState });
     const page = await context.newPage();
     try {
+      await blockUnnecessaryResources(page);
       await navigateToBookingForm(page);
       return await checkDate(page, dateEntry, workerId);
     } catch (err) {
@@ -292,6 +322,7 @@ async function main() {
     // the consent screen.
     const loginContext = await browser.newContext();
     const loginPage = await loginContext.newPage();
+    await blockUnnecessaryResources(loginPage);
     await navigateToBookingForm(loginPage);
     console.log('✅ On booking form:', loginPage.url());
 
@@ -310,21 +341,42 @@ async function main() {
     const augustDates = allAvailableDates.filter(d => parseInt(d.month) === AUGUST_MONTH_INDEX);
     if (augustDates.length === 0) {
       console.log('❌ No available dates in August');
+      if (DISCOVER_ONLY) {
+        fs.writeFileSync(DISCOVER_OUTPUT, JSON.stringify([]));
+        console.log(`💾 Wrote empty day list to ${DISCOVER_OUTPUT}`);
+      }
       await browser.close();
       return;
     }
     console.log(`📅 Available dates (August, whole month): ${augustDates.map(d => `${d.date}/${parseInt(d.month) + 1}/${d.year}`).join(', ')}`);
 
+    // Discover-only mode: report which August days are open and stop — no
+    // slot/service checking, so this finishes in one quick pass instead of
+    // paying for 31 jobs' worth of consent+browser overhead up front.
+    if (DISCOVER_ONLY) {
+      const days = [...new Set(augustDates.map(d => parseInt(d.date)))].sort((a, b) => a - b);
+      fs.writeFileSync(DISCOVER_OUTPUT, JSON.stringify(days));
+      console.log(`🔎 Discovered ${days.length} open August day(s): ${days.join(', ')}`);
+      console.log(`💾 Wrote day list to ${DISCOVER_OUTPUT}`);
+      await browser.close();
+      return;
+    }
+
     let availableDates = augustDates;
-    if (TARGET_DAY !== null) {
-      availableDates = augustDates.filter(d => parseInt(d.date) === TARGET_DAY);
-      console.log(`🎯 Matrix mode: restricting to August ${TARGET_DAY} only`);
+    let missingRequestedDays = [];
+    if (TARGET_DAYS !== null) {
+      availableDates = augustDates.filter(d => TARGET_DAYS.includes(parseInt(d.date)));
+      missingRequestedDays = TARGET_DAYS.filter(day => !augustDates.some(d => parseInt(d.date) === day));
+      console.log(`🎯 Matrix mode: restricting to August days [${TARGET_DAYS.join(', ')}]`);
+      if (missingRequestedDays.length > 0) {
+        console.log(`⚠️  Not open for booking: August ${missingRequestedDays.join(', ')}`);
+      }
       if (availableDates.length === 0) {
-        console.log(`❌ August ${TARGET_DAY} is not open for booking (not in the calendar's available dates)`);
+        console.log(`❌ None of the requested days [${TARGET_DAYS.join(', ')}] are open for booking`);
         if (RESULTS_FILE) {
           fs.writeFileSync(RESULTS_FILE, JSON.stringify({
             overview: [], ociAvailable: [], surrenderAvailable: [],
-            targetDay: TARGET_DAY, checkedAt: new Date().toISOString(),
+            targetDays: TARGET_DAYS, missingRequestedDays, checkedAt: new Date().toISOString(),
           }, null, 2));
           console.log(`💾 Wrote empty result to ${RESULTS_FILE}`);
         }
@@ -349,7 +401,7 @@ async function main() {
     if (RESULTS_FILE) {
       fs.writeFileSync(RESULTS_FILE, JSON.stringify({
         overview, ociAvailable, surrenderAvailable,
-        targetDay: TARGET_DAY, checkedAt: new Date().toISOString(),
+        targetDays: TARGET_DAYS, missingRequestedDays, checkedAt: new Date().toISOString(),
       }, null, 2));
       console.log(`💾 Wrote results to ${RESULTS_FILE}`);
     }
